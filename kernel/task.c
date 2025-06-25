@@ -6,6 +6,7 @@
  */
 
 #include <hal.h>
+#include <spinlock.h>
 #include <lib/queue.h>
 #include <sys/task.h>
 
@@ -46,6 +47,9 @@ static struct {
     tcb_t *task;
 } task_cache[TASK_CACHE_SIZE];
 static uint8_t cache_index = 0;
+
+static spinlock_t task_lock = SPINLOCK_INITIALIZER;
+static uint32_t task_flags = 0;
 
 static inline bool is_valid_task(tcb_t *task)
 {
@@ -389,12 +393,12 @@ int32_t mo_task_spawn(void *task_entry, uint16_t stack_size_req)
     }
 
     /* Minimize critical section duration */
-    CRITICAL_ENTER();
+    spin_lock_irqsave(&task_lock, &task_flags);
 
     if (!kcb->tasks) {
         kcb->tasks = list_create();
         if (!kcb->tasks) {
-            CRITICAL_LEAVE();
+            spin_unlock_irqrestore(&task_lock, task_flags);
             free(tcb->stack);
             free(tcb);
             panic(ERR_KCB_ALLOC);
@@ -403,7 +407,7 @@ int32_t mo_task_spawn(void *task_entry, uint16_t stack_size_req)
 
     list_node_t *node = list_pushback(kcb->tasks, tcb);
     if (!node) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         free(tcb->stack);
         free(tcb);
         panic(ERR_TCB_ALLOC);
@@ -416,7 +420,7 @@ int32_t mo_task_spawn(void *task_entry, uint16_t stack_size_req)
     if (!kcb->task_current)
         kcb->task_current = node;
 
-    CRITICAL_LEAVE();
+    spin_unlock_irqrestore(&task_lock, task_flags);
 
     /* Initialize execution context outside critical section */
     hal_context_init(&tcb->context, (size_t) tcb->stack, new_stack_size,
@@ -436,16 +440,16 @@ int32_t mo_task_cancel(uint16_t id)
     if (id == 0 || id == mo_task_id())
         return ERR_TASK_CANT_REMOVE;
 
-    CRITICAL_ENTER();
+    spin_lock_irqsave(&task_lock, &task_flags);
     list_node_t *node = find_task_node_by_id(id);
     if (!node) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return ERR_TASK_NOT_FOUND;
     }
 
     tcb_t *tcb = node->data;
     if (!tcb || tcb->state == TASK_RUNNING) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return ERR_TASK_CANT_REMOVE;
     }
 
@@ -465,7 +469,7 @@ int32_t mo_task_cancel(uint16_t id)
     if (kcb->last_ready_hint == node)
         kcb->last_ready_hint = NULL;
 
-    CRITICAL_LEAVE();
+    spin_unlock_irqrestore(&task_lock, task_flags);
 
     /* Free memory outside critical section */
     free(tcb->stack);
@@ -484,16 +488,16 @@ void mo_task_delay(uint16_t ticks)
     if (!ticks)
         return;
 
-    NOSCHED_ENTER();
+    spin_lock_irqsave(&task_lock, &task_flags);
     if (unlikely(!kcb || !kcb->task_current || !kcb->task_current->data)) {
-        NOSCHED_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return;
     }
 
     tcb_t *self = kcb->task_current->data;
     self->delay = ticks;
     self->state = TASK_BLOCKED;
-    NOSCHED_LEAVE();
+    spin_unlock_irqrestore(&task_lock, task_flags);
 
     mo_task_yield();
 }
@@ -503,17 +507,17 @@ int32_t mo_task_suspend(uint16_t id)
     if (id == 0)
         return ERR_TASK_NOT_FOUND;
 
-    CRITICAL_ENTER();
+    spin_lock_irqsave(&task_lock, &task_flags);
     list_node_t *node = find_task_node_by_id(id);
     if (!node) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return ERR_TASK_NOT_FOUND;
     }
 
     tcb_t *task = node->data;
     if (!task || (task->state != TASK_READY && task->state != TASK_RUNNING &&
                   task->state != TASK_BLOCKED)) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return ERR_TASK_CANT_SUSPEND;
     }
 
@@ -524,7 +528,7 @@ int32_t mo_task_suspend(uint16_t id)
     if (kcb->last_ready_hint == node)
         kcb->last_ready_hint = NULL;
 
-    CRITICAL_LEAVE();
+    spin_unlock_irqrestore(&task_lock, task_flags);
 
     if (is_current)
         mo_task_yield();
@@ -537,21 +541,21 @@ int32_t mo_task_resume(uint16_t id)
     if (id == 0)
         return ERR_TASK_NOT_FOUND;
 
-    CRITICAL_ENTER();
+    spin_lock_irqsave(&task_lock, &task_flags);
     list_node_t *node = find_task_node_by_id(id);
     if (!node) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return ERR_TASK_NOT_FOUND;
     }
 
     tcb_t *task = node->data;
     if (!task || task->state != TASK_SUSPENDED) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return ERR_TASK_CANT_RESUME;
     }
 
     task->state = TASK_READY;
-    CRITICAL_LEAVE();
+    spin_unlock_irqrestore(&task_lock, task_flags);
     return ERR_OK;
 }
 
@@ -560,22 +564,22 @@ int32_t mo_task_priority(uint16_t id, uint16_t priority)
     if (id == 0 || !is_valid_priority(priority))
         return ERR_TASK_INVALID_PRIO;
 
-    CRITICAL_ENTER();
+    spin_lock_irqsave(&task_lock, &task_flags);
     list_node_t *node = find_task_node_by_id(id);
     if (!node) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return ERR_TASK_NOT_FOUND;
     }
 
     tcb_t *task = node->data;
     if (!task) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return ERR_TASK_NOT_FOUND;
     }
 
     uint8_t base = (uint8_t) (priority >> 8);
     task->prio = ((uint16_t) base << 8) | base;
-    CRITICAL_LEAVE();
+    spin_unlock_irqrestore(&task_lock, task_flags);
 
     return ERR_OK;
 }
@@ -585,21 +589,21 @@ int32_t mo_task_rt_priority(uint16_t id, void *priority)
     if (id == 0)
         return ERR_TASK_NOT_FOUND;
 
-    CRITICAL_ENTER();
+    spin_lock_irqsave(&task_lock, &task_flags);
     list_node_t *node = find_task_node_by_id(id);
     if (!node) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return ERR_TASK_NOT_FOUND;
     }
 
     tcb_t *task = node->data;
     if (!task) {
-        CRITICAL_LEAVE();
+        spin_unlock_irqrestore(&task_lock, task_flags);
         return ERR_TASK_NOT_FOUND;
     }
 
     task->rt_prio = priority;
-    CRITICAL_LEAVE();
+    spin_unlock_irqrestore(&task_lock, task_flags);
     return ERR_OK;
 }
 
@@ -615,9 +619,9 @@ int32_t mo_task_idref(void *task_entry)
     if (!task_entry || !kcb->tasks)
         return ERR_TASK_NOT_FOUND;
 
-    CRITICAL_ENTER();
+    spin_lock_irqsave(&task_lock, &task_flags);
     list_node_t *node = list_foreach(kcb->tasks, refcmp, task_entry);
-    CRITICAL_LEAVE();
+    spin_unlock_irqrestore(&task_lock, task_flags);
 
     return node ? ((tcb_t *) node->data)->id : ERR_TASK_NOT_FOUND;
 }
