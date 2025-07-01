@@ -258,6 +258,8 @@ static list_node_t *find_next_ready_task(void)
 /* Scheduler with reduced overhead */
 static uint16_t schedule_next_task(void)
 {
+    uint32_t flag = 0;
+
     if (unlikely(!get_task_current() || !get_task_current()->data))
         panic(ERR_NO_TASKS);
 
@@ -267,7 +269,9 @@ static uint16_t schedule_next_task(void)
         current_task->state = TASK_READY;
 
     /* Try to find the next ready task */
+    spin_lock_irqsave(&kcb->kcb_lock, &flag);
     list_node_t *next_node = find_next_ready_task();
+    spin_unlock_irqrestore(&kcb->kcb_lock, flag);
     if (unlikely(!next_node)) {
         panic(ERR_NO_TASKS);
     }
@@ -301,6 +305,8 @@ void dispatcher(void)
 /* Top-level context-switch for preemptive scheduling. */
 void dispatch(void)
 {
+    uint32_t flag = 0;
+
     if (unlikely(!kcb || !get_task_current() || !get_task_current()->data))
         panic(ERR_NO_TASKS);
 
@@ -308,8 +314,10 @@ void dispatch(void)
     if (setjmp(((tcb_t *) get_task_current()->data)->context) != 0)
         return;
 
+    spin_lock_irqsave(&kcb->kcb_lock, &flag);
     task_stack_check();
     list_foreach(kcb->tasks, delay_update, NULL);
+    spin_unlock_irqrestore(&kcb->kcb_lock, flag);
 
     /* Hook for real-time scheduler - if it selects a task, use it */
     if (kcb->rt_sched() < 0) {
@@ -323,6 +331,8 @@ void dispatch(void)
 /* Cooperative context switch */
 void yield(void)
 {
+    uint32_t flag = 0;
+
     if (unlikely(!kcb || !get_task_current() || !get_task_current()->data))
         return;
 
@@ -332,10 +342,13 @@ void yield(void)
     task_stack_check();
 
     /* In cooperative mode, delays are only processed on an explicit yield. */
+    spin_lock_irqsave(&kcb->kcb_lock, &flag);
+
     if (!kcb->preemptive)
         list_foreach(kcb->tasks, delay_update, NULL);
 
     schedule_next_task();
+    spin_unlock_irqrestore(&kcb->kcb_lock, flag);
     longjmp(((tcb_t *) get_task_current()->data)->context, 1);
 }
 
@@ -620,10 +633,13 @@ uint16_t mo_task_id(void)
 
 int32_t mo_task_idref(void *task_entry)
 {
-    if (!task_entry || !kcb->tasks)
-        return ERR_TASK_NOT_FOUND;
-
     spin_lock_irqsave(&kcb->kcb_lock, &task_flags);
+
+    if (!task_entry || !kcb->tasks) {
+        spin_unlock_irqrestore(&kcb->kcb_lock, task_flags);
+        return ERR_TASK_NOT_FOUND;
+    }
+
     list_node_t *node = list_foreach(kcb->tasks, refcmp, task_entry);
     spin_unlock_irqrestore(&kcb->kcb_lock, task_flags);
 
@@ -632,22 +648,46 @@ int32_t mo_task_idref(void *task_entry)
 
 void mo_task_wfi(void)
 {
+    uint32_t flag = 0;
+
     if (!kcb->preemptive)
         return;
 
+    spin_lock_irqsave(&kcb->kcb_lock, &flag);
     volatile uint32_t current_ticks = kcb->ticks;
-    while (current_ticks == kcb->ticks)
+    spin_unlock_irqrestore(&kcb->kcb_lock, flag);
+
+    while (1) {
+        spin_lock_irqsave(&kcb->kcb_lock, &flag);
+        if (current_ticks != kcb->ticks) {
+            spin_unlock_irqrestore(&kcb->kcb_lock, flag);
+            break;
+        }
+        spin_unlock_irqrestore(&kcb->kcb_lock, flag);
         hal_cpu_idle();
+    }
 }
 
 uint16_t mo_task_count(void)
 {
-    return kcb->task_count;
+    uint32_t task_count;
+    uint32_t flag;
+
+    spin_lock_irqsave(&kcb->kcb_lock, &flag);
+    task_count = kcb->task_count;
+    spin_unlock_irqrestore(&kcb->kcb_lock, flag);
+    return task_count;
 }
 
 uint32_t mo_ticks(void)
 {
-    return kcb->ticks;
+    uint32_t ticks;
+    uint32_t flag;
+
+    spin_lock_irqsave(&kcb->kcb_lock, &flag);
+    ticks = kcb->ticks;
+    spin_unlock_irqrestore(&kcb->kcb_lock, flag);
+    return ticks;
 }
 
 uint64_t mo_uptime(void)
